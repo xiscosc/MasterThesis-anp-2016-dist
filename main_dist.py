@@ -151,7 +151,7 @@ def loss(logits, labels, smoothed_labels_matrix=None):
     labels = tf.cast(labels, tf.int64)
     if not FLAGS.label_smoothing:
         cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            logits, labels, name='cross_entropy_per_example')
+            logits=logits, labels=labels, name='cross_entropy_per_example')
     else:
         labels = tf.gather(smoothed_labels_matrix, labels, name='label_smoothing')
         normalized_logits = tf.nn.softmax(logits, name='softmax')

@@ -408,7 +408,7 @@ def train(cluster, server):
                 accumulated_top5_accuracy_10_steps = 0.
                 accumulated_top5_accuracy_100_steps = 0.
 
-                for step in range(1000000):
+                for step in range(FLAGS.max_steps):
                     start_time = time.time()
                     _, loss_value, top1_accuracy_value, top5_accuracy_value = sess.run([train_op, loss_op,
                                                                                         top1_accuracy_op,
@@ -462,7 +462,7 @@ def train(cluster, server):
                         saver.save(sess, checkpoint_path, global_step=int(global_step.eval()))
 
                     """
-                    if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == 1000000):
+                        if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == FLAGS.max_steps):
                         num = len(FLAGS.worker_hosts.split(','))
                         jobname = ("/gpfs/projects/bsc31/bsc31953/eval%d.cmd" % num)
                         message = "STEP %d EVAL JOB %s sended" % (step, jobname)

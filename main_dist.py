@@ -462,7 +462,7 @@ def train(cluster, server):
                         saver.save(sess, checkpoint_path, global_step=int(global_step.eval()))
 
                     """
-                        if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == FLAGS.max_steps):
+                    if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == FLAGS.max_steps):
                         num = len(FLAGS.worker_hosts.split(','))
                         jobname = ("/gpfs/projects/bsc31/bsc31953/eval%d.cmd" % num)
                         message = "STEP %d EVAL JOB %s sended" % (step, jobname)

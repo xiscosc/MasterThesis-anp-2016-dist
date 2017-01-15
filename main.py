@@ -120,7 +120,6 @@ def _train(cluster, server):
             num_ps_tasks=FLAGS.num_ps_tasks)
 
 
-        deployment = model_deploy.deploy()
 
 
 def main(argv=None):

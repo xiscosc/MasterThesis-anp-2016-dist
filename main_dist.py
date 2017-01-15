@@ -214,13 +214,7 @@ def train(cluster, server):
         #    initializer=tf.constant_initializer(0), trainable=False)
 
         with tf.device('/job:ps/cpu:0'):
-            collections = [tf.GraphKeys.VARIABLES, tf.GraphKeys.GLOBAL_STEP]
-            global_step = tf.get_variable(tf.GraphKeys.GLOBAL_STEP,
-                                          shape=[], dtype=tf.int64,
-                                          initializer=tf.zeros_initializer,
-                                          regularizer=None,
-                                          trainable=False,
-                                          collections=collections)
+            global_step = slim.get_or_create_global_step()
 
         # Calculate the learning rate schedule.
         num_batches_per_epoch = (MVSOData(subset='train').num_examples_per_epoch() / FLAGS.batch_size)
@@ -464,7 +458,7 @@ def train(cluster, server):
                     """
                     if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == FLAGS.max_steps):
                         num = len(FLAGS.worker_hosts.split(','))
-                        jobname = ("/gpfs/projects/bsc31/bsc31953/eval%d.cmd" % num)
+                        jobname = ("/gpfs/projects/bsc31/bsc31953/DISTRIBUTED/eval%d.cmd" % num)
                         message = "STEP %d EVAL JOB %s sended" % (step, jobname)
                         tf.logging.info(message)
                         subprocess.check_output(['mnsubmit', jobname])

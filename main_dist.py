@@ -365,9 +365,7 @@ def train(cluster, server):
             init_op=init,
         )
 
-
-
-
+        """
         sv = tf.train.Supervisor(
             is_chief=is_chief,
             summary_op=None,
@@ -378,7 +376,6 @@ def train(cluster, server):
             save_summaries_secs=30,
             saver=saver_cp)
 
-        """
         sess = tf.InteractiveSession(config=tf.ConfigProto(
             allow_soft_placement=True,
             log_device_placement=FLAGS.log_device_placement))

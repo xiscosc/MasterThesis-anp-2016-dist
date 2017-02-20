@@ -114,8 +114,8 @@ def tower_loss(scope, reuse):
     total_loss = tf.add_n(losses, name='total_loss')
 
     # Compute the moving average of all individual losses and the total loss.
-    loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
-    loss_averages_op = loss_averages.apply(losses + [total_loss])
+    # loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
+    # loss_averages_op = loss_averages.apply(losses + [total_loss])
 
     # Attach a scalar summary to all individual losses and the total loss; do the
     # same for the averaged version of the losses.
@@ -128,10 +128,10 @@ def tower_loss(scope, reuse):
         # Name each loss as '(raw)' and name the moving average version of the loss
         # as the original loss name.
         tf.summary.scalar(loss_name +' (raw)', l)
-        tf.summary.scalar(loss_name, loss_averages.average(l))
+        # tf.summary.scalar(loss_name, loss_averages.average(l))
 
-    with tf.control_dependencies([loss_averages_op]):
-        total_loss = tf.identity(total_loss)
+    # with tf.control_dependencies([loss_averages_op]):
+    #     total_loss = tf.identity(total_loss)
     return total_loss, logits, labels
 
 
@@ -155,7 +155,7 @@ def loss(logits, labels, smoothed_labels_matrix=None):
     else:
         labels = tf.gather(smoothed_labels_matrix, labels, name='label_smoothing')
         normalized_logits = tf.nn.softmax(logits, name='softmax')
-        cross_entropy = -tf.reduce_sum(tf.multiply(labels, tf.log(tf.clip_by_value(normalized_logits, 1e-9, 1.0))), 1,
+        cross_entropy = -tf.reduce_sum(tf.mul(labels, tf.log(tf.clip_by_value(normalized_logits, 1e-9, 1.0))), 1,
                                        name='cross_entropy_per_example')
     cross_entropy_mean = tf.reduce_mean(cross_entropy, name='cross_entropy')
     tf.add_to_collection('losses', cross_entropy_mean)
@@ -189,7 +189,7 @@ def average_gradients(tower_grads):
             grads.append(expanded_g)
 
         # Average over the 'tower' dimension.
-        grad = tf.concat(axis=0, values=grads)
+        grad = tf.concat_v2(grads, 0)
         grad = tf.reduce_mean(grad, 0)
 
         # Keep in mind that the Variables are redundant because they are shared
@@ -214,13 +214,7 @@ def train(cluster, server):
         #    initializer=tf.constant_initializer(0), trainable=False)
 
         with tf.device('/job:ps/cpu:0'):
-            collections = [tf.GraphKeys.VARIABLES, tf.GraphKeys.GLOBAL_STEP]
-            global_step = tf.get_variable(tf.GraphKeys.GLOBAL_STEP,
-                                          shape=[], dtype=tf.int64,
-                                          initializer=tf.zeros_initializer(),
-                                          regularizer=None,
-                                          trainable=False,
-                                          collections=collections)
+            global_step = slim.get_or_create_global_step()
 
         # Calculate the learning rate schedule.
         num_batches_per_epoch = (MVSOData(subset='train').num_examples_per_epoch() / FLAGS.batch_size)
@@ -259,17 +253,24 @@ def train(cluster, server):
         tower_labels = []
         tower_losses = []
         reuse = None
+
+        with tf.variable_scope(tf.get_variable_scope()) as vscope:
+            for i in range(FLAGS.num_gpus):
+                tf.logging.info("INIT TOWER: %d" % i)
+                with tf.name_scope('%s_%d' % ('tower', i)) as scope:
+                    with tf.device('/job:worker/GPU:%d' % i):
+                        # Calculate the loss for one tower. This function constructs
+                        # the entire model but shares the variables across all towers.
+                        loss, logits, labels = tower_loss(scope, reuse)
+
+                        # Reuse variables for the next tower.
+                        reuse = True
+                        tf.get_variable_scope().reuse_variables()
+
         for i in range(FLAGS.num_gpus):
+            tf.logging.info("INIT TOWER: %d" % i)
             with tf.name_scope('%s_%d' % ('tower', i)) as scope:
                 with tf.device('/job:worker/GPU:%d' % i):
-                    # Calculate the loss for one tower. This function constructs
-                    # the entire model but shares the variables across all towers.
-                    loss, logits, labels = tower_loss(scope, reuse)
-
-                    # Reuse variables for the next tower.
-                    reuse = True
-                    tf.get_variable_scope().reuse_variables()
-
                     # Retain the summaries from the final tower.
                     summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
 
@@ -283,8 +284,8 @@ def train(cluster, server):
                     tower_losses.append(loss)
 
         # Concatenate the outputs of all towers
-        logits_op = tf.concat(axis=0, values=tower_logits, name='concat_logits')
-        labels_op = tf.concat(axis=0, values=tower_labels, name='concat_labels')
+        logits_op = tf.concat_v2(tower_logits, 0, 'concat_logits')
+        labels_op = tf.concat_v2(tower_labels, 0, 'concat_labels')
         loss_op = tf.reduce_mean(tower_losses)
 
         # Update BN's moving_mean and moving_variance
@@ -320,8 +321,10 @@ def train(cluster, server):
                 if grad is not None:
                     summaries.append(tf.summary.histogram(var.op.name + '/gradients', grad))
 
-        for op in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES):
-            tf.logging.info(op.name)
+        # for op in tf.get_collection(tf.GraphKeys.VARIABLES):
+        #     tf.logging.info(op.name)
+
+        # tf.logging.info([var.op.name for var in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)])
 
         # Apply the gradients to adjust the shared variables.
         apply_gradient_op = opt.apply_gradients(grads, global_step=global_step)
@@ -333,19 +336,21 @@ def train(cluster, server):
 
         # Track the moving averages of all trainable variables.
         variable_averages = tf.train.ExponentialMovingAverage(FLAGS.moving_average_decay, global_step)
+        for op in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES):
+            tf.logging.info(op.name)
         variables_averages_op = variable_averages.apply(tf.trainable_variables())
 
         # Group all updates to into a single train op.
         train_op = tf.group(apply_gradient_op, variables_averages_op)
 
         # Create a saver.
-        saver_cp = tf.train.Saver(tf.global_variables(), max_to_keep=2)
+        saver_cp = tf.train.Saver(tf.all_variables(), max_to_keep=2, sharded=True)
 
         # Build the summary operation from the last tower summaries.
         summary_op = tf.summary.merge(summaries)
 
         # Build an initialization operation to run below.
-        init = tf.global_variables_initializer()
+        init = tf.initialize_all_variables()
 
         # Start running operations on the Graph. allow_soft_placement must be set to
         # True to build towers on GPU, as some of the ops do not have GPU implementations.
@@ -357,16 +362,6 @@ def train(cluster, server):
                                                      scope='anp_resnet50',
                                                      restore_logits=FLAGS.restore_logits,
                                                      model_generation_func=cnn_generator.resnet_v1_50)
-
-
-
-        scaffold = tf.train.Scaffold(
-            saver=saver_cp,
-            init_op=init,
-        )
-
-
-
 
         sv = tf.train.Supervisor(
             is_chief=is_chief,
@@ -385,15 +380,7 @@ def train(cluster, server):
         sess.run(init)
         """
         config = tf.ConfigProto(allow_soft_placement=True)
-
-        with tf.train.MonitoredTrainingSession(is_chief=is_chief,
-                                               checkpoint_dir=FLAGS.train_dir,
-                                               save_summaries_steps=100,
-                                               scaffold=scaffold,
-                                               master=server.target,
-                                               config=config) as sess:
-
-        #with sv.managed_session(server.target, config=config) as sess:
+        with sv.managed_session(server.target, config=config) as sess:
             with sess.as_default():
                 tf.logging.info('%s %s %d: Session initialization complete.' %
                                 (datetime.now(), FLAGS.job_name, FLAGS.task_index))
@@ -406,10 +393,10 @@ def train(cluster, server):
                 if not FLAGS.resume_training and FLAGS.checkpoint is not None:
                     saver.restore(sess, FLAGS.checkpoint)
 
-                # if is_chief:
-                #     if FLAGS.train_dir:
-                #         sv.start_standard_services(sess)
-                # sv.start_queue_runners(sess)
+                if is_chief:
+                    if FLAGS.train_dir:
+                        sv.start_standard_services(sess)
+                sv.start_queue_runners(sess)
 
                 # Manually set the learning rate if there is no learning rate decay and we are resuming training
                 # if not FLAGS.exponential_decay and FLAGS.resume_training:

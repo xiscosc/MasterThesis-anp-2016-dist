@@ -79,7 +79,7 @@ def decode_jpeg(image_buffer, scope=None):
     Returns:
       3-D float Tensor with values ranging from [0, 1).
     """
-    with tf.op_scope([image_buffer], scope, 'decode_jpeg'):
+    with tf.name_scope(scope, default_name='decode_jpeg', values=[image_buffer]):
         # Decode the string as an RGB JPEG.
         # Note that the resulting image contains an unknown height and width
         # that is set dynamically by decode_jpeg. In other words, the height
@@ -153,7 +153,7 @@ def parse_example_proto(example_serialized):
     ymax = tf.expand_dims(features['image/object/bbox/ymax'].values, 0)
 
     # Note that we impose an ordering of (y, x) just to make life difficult.
-    bbox = tf.concat(0, [ymin, xmin, ymax, xmax])
+    bbox = tf.concat([ymin, xmin, ymax, xmax], 0)
 
     # Force the variable number of bounding boxes into the shape
     # [1, num_boxes, coords].
@@ -247,7 +247,7 @@ def batch_inputs(dataset, batch_size, train, num_preprocess_threads=None, num_re
             # Parse a serialized Example proto to extract the image and metadata.
             image_buffer, label_index, bbox, _, filename = parse_example_proto(example_serialized)
             image = decode_jpeg(image_buffer)
-            image = tf.mul(255., image)
+            image = tf.multiply(255., image)
             image = image_processing_fn(image, FLAGS.image_size, FLAGS.image_size, is_training=train)
             if FLAGS.multi_task:
                 images_and_labels.append([image, label_index[0], label_index[1], label_index[2], filename])
@@ -315,7 +315,7 @@ def generate_batch(dataset, batch_size=None, train=False, num_preprocess_threads
     assert isinstance(image_processing_fn, types.FunctionType)
 
     # Force all input processing onto CPU in order to reserve the GPU for the forward inference and back-propagation.
-    with tf.device('/cpu:0'):
+    with tf.device('/cpu:0') as dev:
         batch_tensors = batch_inputs(
             dataset, batch_size, train=train,
             num_preprocess_threads=num_preprocess_threads,

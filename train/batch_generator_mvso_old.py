@@ -153,7 +153,7 @@ def parse_example_proto(example_serialized):
     ymax = tf.expand_dims(features['image/object/bbox/ymax'].values, 0)
 
     # Note that we impose an ordering of (y, x) just to make life difficult.
-    bbox = tf.concat_v2([ymin, xmin, ymax, xmax], 0)
+    bbox = tf.concat(0, [ymin, xmin, ymax, xmax])
 
     # Force the variable number of bounding boxes into the shape
     # [1, num_boxes, coords].
@@ -315,7 +315,7 @@ def generate_batch(dataset, batch_size=None, train=False, num_preprocess_threads
     assert isinstance(image_processing_fn, types.FunctionType)
 
     # Force all input processing onto CPU in order to reserve the GPU for the forward inference and back-propagation.
-    with tf.device('/cpu:0') as dev:
+    with tf.device('/cpu:0'):
         batch_tensors = batch_inputs(
             dataset, batch_size, train=train,
             num_preprocess_threads=num_preprocess_threads,

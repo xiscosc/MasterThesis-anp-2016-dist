@@ -9,7 +9,7 @@ import subprocess
 import numpy as np
 import tensorflow as tf
 
-from train import batch_generator_mvso_dist as batch_generator_mvso
+from train import batch_generator_mvso
 from train.mvso_data import MVSOData
 from cnn_definitions import cnn_generator, vgg_preprocessing
 from train.embedding_utils import *
@@ -58,9 +58,9 @@ tf.app.flags.DEFINE_string('worker_hosts', '', 'Comma-separated list of hostname
 tf.app.flags.DEFINE_string('job_name', '', 'One of "ps", "worker"')
 tf.app.flags.DEFINE_string('worker_url', None, 'Worker GRPC URL')
 tf.app.flags.DEFINE_integer('task_index', 0, 'Index of task within the job')
+tf.app.flags.DEFINE_boolean('sync_replicas', False, """Use SyncReplicasOptimizer""")
 is_chief = (FLAGS.task_index == 0)
 slim = tf.contrib.slim
-
 
 
 def tower_loss(scope, reuse):
@@ -114,8 +114,8 @@ def tower_loss(scope, reuse):
     total_loss = tf.add_n(losses, name='total_loss')
 
     # Compute the moving average of all individual losses and the total loss.
-    loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
-    loss_averages_op = loss_averages.apply(losses + [total_loss])
+    #loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
+    #loss_averages_op = loss_averages.apply(losses + [total_loss])
 
     # Attach a scalar summary to all individual losses and the total loss; do the
     # same for the averaged version of the losses.
@@ -127,11 +127,11 @@ def tower_loss(scope, reuse):
         tf.logging.info('Creating summary for %s', l.op.name)
         # Name each loss as '(raw)' and name the moving average version of the loss
         # as the original loss name.
-        tf.summary.scalar(loss_name +' (raw)', l)
-        tf.summary.scalar(loss_name, loss_averages.average(l))
+       # tf.summary.scalar(loss_name +' (raw)', l)
+       # tf.summary.scalar(loss_name, loss_averages.average(l))
 
-    with tf.control_dependencies([loss_averages_op]):
-        total_loss = tf.identity(total_loss)
+    #with tf.control_dependencies([loss_averages_op]):
+    #    total_loss = tf.identity(total_loss)
     return total_loss, logits, labels
 
 
@@ -214,7 +214,7 @@ def train(cluster, server):
         #    initializer=tf.constant_initializer(0), trainable=False)
 
         with tf.device('/job:ps/cpu:0'):
-            collections = [tf.GraphKeys.VARIABLES, tf.GraphKeys.GLOBAL_STEP]
+            collections = [tf.GraphKeys.GLOBAL_VARIABLES, tf.GraphKeys.GLOBAL_STEP]
             global_step = tf.get_variable(tf.GraphKeys.GLOBAL_STEP,
                                           shape=[], dtype=tf.int64,
                                           initializer=tf.zeros_initializer(),
@@ -253,34 +253,41 @@ def train(cluster, server):
         else:
             raise AttributeError('The specified optimizer is not supported')
 
+
+        if FLAGS.sync_replicas:
+            opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=2,
+                                       total_num_replicas=2)
+
+
         # Calculate the gradients for each model tower.
         tower_grads = []
         tower_logits = []
         tower_labels = []
         tower_losses = []
         reuse = None
-        for i in range(FLAGS.num_gpus):
-            with tf.name_scope('%s_%d' % ('tower', i)) as scope:
-                with tf.device('/job:worker/GPU:%d' % i):
-                    # Calculate the loss for one tower. This function constructs
-                    # the entire model but shares the variables across all towers.
-                    loss, logits, labels = tower_loss(scope, reuse)
+        with tf.variable_scope(tf.get_variable_scope()) as vscope:
+            for i in range(FLAGS.num_gpus):
+                with tf.name_scope('%s_%d' % ('tower', i)) as scope:
+                    with tf.device('/job:worker/GPU:%d' % i):
+                        # Calculate the loss for one tower. This function constructs
+                        # the entire model but shares the variables across all towers.
+                        loss, logits, labels = tower_loss(scope, reuse)
 
-                    # Reuse variables for the next tower.
-                    reuse = True
-                    tf.get_variable_scope().reuse_variables()
+                        # Reuse variables for the next tower.
+                        reuse = True
+                        tf.get_variable_scope().reuse_variables()
 
-                    # Retain the summaries from the final tower.
-                    summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
+                        # Retain the summaries from the final tower.
+                        summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
 
-                    # Calculate the gradients for the batch of data on this tower.
-                    grads = opt.compute_gradients(loss)
-                    capped_gvs = [(tf.clip_by_value(grad, -2., 2.), var) for grad, var in grads]
-                    # Keep track of the gradients across all towers.
-                    tower_grads.append(capped_gvs)
-                    tower_logits.append(logits)
-                    tower_labels.append(labels)
-                    tower_losses.append(loss)
+                        # Calculate the gradients for the batch of data on this tower.
+                        grads = opt.compute_gradients(loss)
+                        capped_gvs = [(tf.clip_by_value(grad, -2., 2.), var) for grad, var in grads]
+                        # Keep track of the gradients across all towers.
+                        tower_grads.append(capped_gvs)
+                        tower_logits.append(logits)
+                        tower_labels.append(labels)
+                        tower_losses.append(loss)
 
         # Concatenate the outputs of all towers
         logits_op = tf.concat(axis=0, values=tower_logits, name='concat_logits')
@@ -351,36 +358,21 @@ def train(cluster, server):
         # True to build towers on GPU, as some of the ops do not have GPU implementations.
 
         if not FLAGS.resume_training and  FLAGS.checkpoint is not None:
-            tf.logging.info('INIT FROM CHECKPOINT')
+            tf.logging.info('INIT RESTORE FROM CHECKPOINT')
             saver = cnn_generator.initialize_from_checkpoint(sess=None,
                                                      checkpoint_path=FLAGS.checkpoint,
                                                      scope='anp_resnet50',
                                                      restore_logits=FLAGS.restore_logits,
                                                      model_generation_func=cnn_generator.resnet_v1_50)
 
-
-
         scaffold = tf.train.Scaffold(
             saver=saver_cp,
             init_op=init,
         )
+        hooks = []
+        if FLAGS.sync_replicas:
+            hooks.append(opt.make_session_run_hook(is_chief))
 
-        """
-        sv = tf.train.Supervisor(
-            is_chief=is_chief,
-            summary_op=None,
-            logdir=FLAGS.train_dir,
-            init_op=init,
-            global_step=global_step,
-            save_model_secs=FLAGS.checkpoint_interval,
-            save_summaries_secs=30,
-            saver=saver_cp)
-
-        sess = tf.InteractiveSession(config=tf.ConfigProto(
-            allow_soft_placement=True,
-            log_device_placement=FLAGS.log_device_placement))
-        sess.run(init)
-        """
         config = tf.ConfigProto(allow_soft_placement=True)
 
         with tf.train.MonitoredTrainingSession(is_chief=is_chief,
@@ -388,107 +380,77 @@ def train(cluster, server):
                                                save_summaries_steps=100,
                                                scaffold=scaffold,
                                                master=server.target,
+                                               hooks=hooks,
                                                config=config) as sess:
 
-        #with sv.managed_session(server.target, config=config) as sess:
-            with sess.as_default():
-                tf.logging.info('%s %s %d: Session initialization complete.' %
-                                (datetime.now(), FLAGS.job_name, FLAGS.task_index))
+            tf.logging.info('%s %s %d: Session initialization complete.' %
+                            (datetime.now(), FLAGS.job_name, FLAGS.task_index))
 
-                # if FLAGS.resume_training:
-                #     ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
-                #     if ckpt and ckpt.model_checkpoint_path:
-                #         tf.logging.info("RESUME TRAINING")
-                #         saver_cp.restore(sess, ckpt.model_checkpoint_path)
-                if not FLAGS.resume_training and FLAGS.checkpoint is not None:
-                    saver.restore(sess, FLAGS.checkpoint)
 
-                # if is_chief:
-                #     if FLAGS.train_dir:
-                #         sv.start_standard_services(sess)
-                # sv.start_queue_runners(sess)
+            if not FLAGS.resume_training and FLAGS.checkpoint is not None:
+                saver.restore(sess, FLAGS.checkpoint)
 
-                # Manually set the learning rate if there is no learning rate decay and we are resuming training
-                # if not FLAGS.exponential_decay and FLAGS.resume_training:
-                #     tf.logging.info('Overwriting stored learning rate. Using constant learning rate of %f',
-                #                     FLAGS.initial_learning_rate)
-                #     sess.run(lr.assign(FLAGS.initial_learning_rate))
+            if is_chief:
+                summary_writer = tf.summary.FileWriter(FLAGS.train_dir, sess.graph)
+            accumulated_top1_accuracy_10_steps = 0.
+            accumulated_top1_accuracy_100_steps = 0.
+            accumulated_top5_accuracy_10_steps = 0.
+            accumulated_top5_accuracy_100_steps = 0.
 
-                # Start the queue runners.
-                # tf.train.start_queue_runners(sess=sess)
-                # if is_chief:
-                #    summary_writer = tf.train.SummaryWriter(FLAGS.train_dir, sess.graph)
-                accumulated_top1_accuracy_10_steps = 0.
-                accumulated_top1_accuracy_100_steps = 0.
-                accumulated_top5_accuracy_10_steps = 0.
-                accumulated_top5_accuracy_100_steps = 0.
+            for step in range(FLAGS.max_steps):
+                start_time = time.time()
+                _, loss_value, top1_accuracy_value, top5_accuracy_value = sess.run([train_op, loss_op,
+                                                                                    top1_accuracy_op,
+                                                                                    top5_accuracy_op])
+                duration = time.time() - start_time
 
-                for step in range(FLAGS.max_steps):
-                    start_time = time.time()
-                    _, loss_value, top1_accuracy_value, top5_accuracy_value = sess.run([train_op, loss_op,
-                                                                                        top1_accuracy_op,
-                                                                                        top5_accuracy_op])
-                    duration = time.time() - start_time
+                assert not np.isnan(loss_value), 'Model diverged with loss = NaN'
 
-                    assert not np.isnan(loss_value), 'Model diverged with loss = NaN'
+                accumulated_top1_accuracy_10_steps += top1_accuracy_value
+                accumulated_top1_accuracy_100_steps += top1_accuracy_value
+                accumulated_top5_accuracy_10_steps += top5_accuracy_value
+                accumulated_top5_accuracy_100_steps += top5_accuracy_value
 
-                    accumulated_top1_accuracy_10_steps += top1_accuracy_value
-                    accumulated_top1_accuracy_100_steps += top1_accuracy_value
-                    accumulated_top5_accuracy_10_steps += top5_accuracy_value
-                    accumulated_top5_accuracy_100_steps += top5_accuracy_value
+                if step == 0:
+                    continue
 
-                    if step == 0:
-                        continue
+                if step % 10 == 0:
+                    num_examples_per_step = FLAGS.batch_size * FLAGS.num_gpus
+                    examples_per_sec = num_examples_per_step / duration
+                    sec_per_batch = duration / FLAGS.num_gpus
 
-                    if step % 10 == 0:
-                        num_examples_per_step = FLAGS.batch_size * FLAGS.num_gpus
-                        examples_per_sec = num_examples_per_step / duration
-                        sec_per_batch = duration / FLAGS.num_gpus
+                    format_str = 'WORKER %d | %s: step %d, global_step = %d, loss = %.2f, top-1 = %.3f%%, top-5 = %.3f%% ' \
+                                 '(%.1f examples/sec; %.3f sec/batch)'
+                    tf.logging.info(format_str % (FLAGS.task_index, datetime.now(), step, int(global_step.eval(session=sess)), loss_value,
+                                                  accumulated_top1_accuracy_10_steps * 10,
+                                                  accumulated_top5_accuracy_10_steps * 10,
+                                                  examples_per_sec, sec_per_batch))
+                    accumulated_top1_accuracy_10_steps = 0.
+                    accumulated_top5_accuracy_10_steps = 0.
 
-                        format_str = 'WORKER %d | %s: step %d, global_step = %d, loss = %.2f, top-1 = %.3f%%, top-5 = %.3f%% ' \
-                                     '(%.1f examples/sec; %.3f sec/batch)'
-                        tf.logging.info(format_str % (FLAGS.task_index, datetime.now(), step, int(global_step.eval()), loss_value,
-                                                      accumulated_top1_accuracy_10_steps * 10,
-                                                      accumulated_top5_accuracy_10_steps * 10,
-                                                      examples_per_sec, sec_per_batch))
-                        accumulated_top1_accuracy_10_steps = 0.
-                        accumulated_top5_accuracy_10_steps = 0.
+                if step % 100 == 0 and is_chief:
+                    summary_str = sess.run(summary_op)
+                    summary_writer.add_summary(summary_str, global_step.eval(session=sess) - 1)
+                    # examples_per_sec_summary = sess.run(tf.scalar_summary('Examples per second', examples_per_sec))
+                    # summary_writer.add_summary(examples_per_sec_summary, global_step.eval() - 1)
+                    # top1_acc_summary = sess.run(tf.scalar_summary('accuracy_top-1 (%)',
+                    #                                               accumulated_top1_accuracy_100_steps))
+                    # summary_writer.add_summary(top1_acc_summary, global_step.eval() - 1)
+                    # top5_acc_summary = sess.run(tf.scalar_summary('accuracy_top-5 (%)',
+                    #                                               accumulated_top5_accuracy_100_steps))
+                    # summary_writer.add_summary(top5_acc_summary, global_step.eval() - 1)
+                    accumulated_top1_accuracy_100_steps = 0.
+                    accumulated_top5_accuracy_100_steps = 0.
 
-                    if step % 100 == 0 and is_chief:
-                        summary_str = sv.summary_computed(sess, sess.run(summary_op))
-                        #summary_str = sess.run(summary_op)
-                        summary_writer = sv.summary_writer
-                        summary_writer.add_summary(summary_str, global_step.eval() - 1)
-                        # examples_per_sec_summary = sess.run(tf.scalar_summary('Examples per second', examples_per_sec))
-                        # summary_writer.add_summary(examples_per_sec_summary, global_step.eval() - 1)
-                        # top1_acc_summary = sess.run(tf.scalar_summary('accuracy_top-1 (%)',
-                        #                                               accumulated_top1_accuracy_100_steps))
-                        # summary_writer.add_summary(top1_acc_summary, global_step.eval() - 1)
-                        # top5_acc_summary = sess.run(tf.scalar_summary('accuracy_top-5 (%)',
-                        #                                               accumulated_top5_accuracy_100_steps))
-                        # summary_writer.add_summary(top5_acc_summary, global_step.eval() - 1)
-                        accumulated_top1_accuracy_100_steps = 0.
-                        accumulated_top5_accuracy_100_steps = 0.
-
-                    # Save the model checkpoint periodically.
-                    """"
-                    if step % 1000 == 0 or (step + 1) == FLAGS.max_steps:
-                        checkpoint_path = os.path.join(FLAGS.train_dir, 'model.ckpt')
-                        saver.save(sess, checkpoint_path, global_step=int(global_step.eval()))
-
-                    """
-                    if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == FLAGS.max_steps):
+                if is_chief and (step % FLAGS.eval_interval_iters == 0 or (step + 1) == FLAGS.max_steps):
+                    if FLAGS.evaluation_job:
+                        jobname = FLAGS.evaluation_job
+                    else:
                         num = len(FLAGS.worker_hosts.split(','))
                         jobname = ("/gpfs/projects/bsc31/bsc31953/DISTRIBUTED/eval%d.cmd" % num)
-                        message = "STEP %d EVAL JOB %s sended" % (step, jobname)
-                        tf.logging.info(message)
-                        subprocess.check_output(['mnsubmit', jobname])
-
-
-
-
-        # Restore model weights
-
+                    message = "STEP %d EVAL JOB %s sent" % (step, jobname)
+                    tf.logging.info(message)
+                    subprocess.check_output(['mnsubmit', jobname])
 
 
 def main(argv=None):

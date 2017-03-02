@@ -59,9 +59,10 @@ tf.app.flags.DEFINE_string('job_name', '', 'One of "ps", "worker"')
 tf.app.flags.DEFINE_string('worker_url', None, 'Worker GRPC URL')
 tf.app.flags.DEFINE_integer('task_index', 0, 'Index of task within the job')
 tf.app.flags.DEFINE_boolean('sync_replicas', False, """Use SyncReplicasOptimizer""")
+tf.app.flags.DEFINE_integer('backup_workers', 0, 'Number of backup workers')
 is_chief = (FLAGS.task_index == 0)
 slim = tf.contrib.slim
-
+num_workers = len(FLAGS.worker_hosts.split(','))
 
 def tower_loss(scope, reuse):
     """
@@ -255,8 +256,11 @@ def train(cluster, server):
 
 
         if FLAGS.sync_replicas:
-            opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=2,
-                                       total_num_replicas=2)
+            replicas = num_workers - FLAGS.backup_workers
+            if replicas < 1:
+                raise ValueError('Too much backup workers')
+            opt = tf.train.SyncReplicasOptimizer(opt, replicas_to_aggregate=replicas,
+                                       total_num_replicas=num_workers)
 
 
         # Calculate the gradients for each model tower.
@@ -446,7 +450,7 @@ def train(cluster, server):
                     if FLAGS.evaluation_job:
                         jobname = FLAGS.evaluation_job
                     else:
-                        num = len(FLAGS.worker_hosts.split(','))
+                        num = num_workers
                         jobname = ("/gpfs/projects/bsc31/bsc31953/DISTRIBUTED/eval%d.cmd" % num)
                     message = "STEP %d EVAL JOB %s sent" % (step, jobname)
                     tf.logging.info(message)
